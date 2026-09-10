@@ -1,12 +1,13 @@
 using LinearAlgebra
 import Ket
-import QuantumNPA
+import Ket.Moment
 import Dualization
 import JuMP
 import Hypatia
+import SparseArrays as SA
 
 """
-    tsirelson_bound_postselection(V::Matrix, S::Matrix, scenario, level; verbose::Bool = false, dualize::Bool = false, solver = Hypatia.Optimizer{_solver_type(T)})
+    bound_tsirelson_postselection(V::Matrix, S::Matrix, scenario, level; verbose::Bool = false, dualize::Bool = false, solver = Hypatia.Optimizer{_solver_type(T)})
 
 Upper bounds the Tsirelson bound of a post-selection game `V`, `S`, written in Collins-Gisin notation.
 `scenario` is a tuple detailing the number of inputs and outputs, in the order (oa, ob, ia, ib).
@@ -14,79 +15,84 @@ Upper bounds the Tsirelson bound of a post-selection game `V`, `S`, written in C
 `verbose` determines whether solver output is printed.
 `dualize` determines whether the dual problem is solved instead. WARNING: This is critical for performance, and the correct choice depends on the solver.
 """
-function tsirelson_bound_postselection(
-    V::Matrix{T},
-    S::Matrix{T},
-    scenario,
-    level;
-    verbose = false,
-    dualize = false,
-    solver = Hypatia.Optimizer{Ket._solver_type(T)}
+function bound_tsirelson_postselection(
+    vcg::Matrix{T},
+    scg::Matrix{T},
+    scenario::Tuple,
+    level::Union{Integer,String};
+    verbose::Bool = false,
+    dualize::Bool = false,
+    solver = Hypatia.Optimizer{Ket._solver_type(T)},
+    solver_attributes = Pair[]
 ) where {T<:Real}
     sT = Ket._solver_type(T)
-    V = convert(AbstractMatrix{sT}, V)
-    S = convert(AbstractMatrix{sT}, S)
+    vcg = convert(AbstractMatrix{sT}, vcg)
+    scg = convert(AbstractMatrix{sT}, scg)
 
-    if level == 1
-        return _tsirelson_bound_postselection_manual(V, S, scenario, false; verbose, dualize = !dualize, solver)
-    elseif level == "1 + A B" || level == "1+ A B" || level == "1 +A B" || level == "1+A B"
-        return _tsirelson_bound_postselection_manual(V, S, scenario, true; verbose, dualize = !dualize, solver)
+    level_int, additional = Moment.parse_level(Val(2), level)
+    if level_int == 1 && (isempty(additional) || additional == [[1, 1]])
+        include_ab = !isempty(additional)
+        return _bound_tsirelson_postselection_manual(vcg, scg, scenario, include_ab; verbose, dualize = !dualize, solver)
     end
 
-    oa, ob, ia, ib = scenario
-    A = QuantumNPA.projector(1, 1:oa-1, 1:ia)
-    B = QuantumNPA.projector(2, 1:ob-1, 1:ib)
-    aind(a, x) = 1 + a + (x - 1) * (oa - 1)
-    bind(b, y) = 1 + b + (y - 1) * (ob - 1)
-
-    model = JuMP.GenericModel{sT}()
-    if dualize
-        JuMP.set_optimizer(model, Dualization.dual_optimizer(solver; coefficient_type = T))
-    else
-        JuMP.set_optimizer(model, solver)
-    end
-    !verbose && JuMP.set_silent(model)
-
-    G_basis = QuantumNPA.npa_moment([vec(A); vec(B)], level)
-    mons = QuantumNPA.monomials(G_basis)
-    JuMP.@variable(model, var[mons])
-    dG = size(G_basis)[1]
-    G = Matrix{typeof(1 * first(var))}(undef, dG, dG)
-    for i ∈ eachindex(G)
-        G[i] = 0
-    end
-    for m ∈ mons
-        Ket._jump_muladd!(G, G_basis[m], var[m])
-    end
-    JuMP.@constraint(model, G in JuMP.PSDCone())
-
-    bell_functional =
-        sum(V[aind(a, x), bind(b, y)] * var[A[a, x]*B[b, y]] for a = 1:oa-1, b = 1:ob-1, x = 1:ia, y = 1:ib)
-    bell_functional += sum(V[aind(a, x), 1] * var[A[a, x]] for a = 1:oa-1, x = 1:ia)
-    bell_functional += sum(V[1, bind(b, y)] * var[B[b, y]] for b = 1:ob-1, y = 1:ib)
-    bell_functional += V[1, 1] * var[QuantumNPA.Id]
-
-    post = sum(S[aind(a, x), bind(b, y)] * var[A[a, x]*B[b, y]] for a = 1:oa-1, b = 1:ob-1, x = 1:ia, y = 1:ib)
-    post += sum(S[aind(a, x), 1] * var[A[a, x]] for a = 1:oa-1, x = 1:ia)
-    post += sum(S[1, bind(b, y)] * var[B[b, y]] for b = 1:ob-1, y = 1:ib)
-    post += S[1, 1] * var[QuantumNPA.Id]
-
-    JuMP.@constraint(model, post == 1)
-    JuMP.@objective(model, Max, bell_functional)
-
-    JuMP.optimize!(model)
-
-    G = JuMP.value.(G)
-    dq1 = 1 + ia * (oa - 1) + ib * (ob - 1)
-    Γ = G[1:dq1, 1:dq1] / JuMP.value(var[QuantumNPA.Id])
-    offset_a = ia * (oa - 1)
-    behaviour = [Γ[1, 1] Γ[1, offset_a+2:end]'; Γ[1, 2:offset_a+1] Γ[2:offset_a+1, offset_a+2:end]]
-
-    JuMP.is_solved_and_feasible(model) || @warn JuMP.raw_status(model)
-    return JuMP.objective_value(model)::sT, behaviour::Matrix{sT}
+    outs = scenario[1:2]
+    ins = scenario[3:4]
+    max_length = 2 * max(level_int, maximum(length.(additional); init = 0))
+    Q, behaviour =
+        _npa_postselection(vcg, scg, Moment.Projector, Val(max_length), outs, ins, level_int, additional; verbose, dualize, solver, solver_attributes)
+    return Q, behaviour
 end
 
-function _tsirelson_bound_postselection_manual(V::Matrix{T}, S::Matrix{T}, scenario, include_ab::Bool; verbose, dualize, solver) where {T<:AbstractFloat}
+function _npa_postselection(
+    vcg::Array{T,N},
+    scg::Array{T,N},
+    ::Type{O},
+    ::Val{M},
+    outs::NTuple{N,<:Integer},
+    ins::NTuple{N,<:Integer},
+    level_int::Int,
+    additional::Vector{Vector{Int}};
+    verbose,
+    dualize,
+    solver,
+    solver_attributes
+) where {T<:AbstractFloat,N,M,O<:Moment.Operator}
+    model = JuMP.GenericModel{T}()
+    MonomialType = Moment.Monomial{N,Moment.OperatorSequence{M,O}}
+    S = Moment.generate_sequences(MonomialType, outs, ins, level_int, additional)
+    monomial_dict, Γ_basis = Moment.moment_matrix(S)
+    number_monomials = length(monomial_dict)
+    JuMP.@variable(model, var[1:number_monomials])
+    dΓ = size(Γ_basis[1], 1)
+    Γ = Matrix{typeof(1 * first(var))}(undef, dΓ, dΓ)
+    for i ∈ eachindex(Γ)
+        Γ[i] = 0
+    end
+    Id = one(eltype(S))
+    for i ∈ 1:number_monomials
+        Ket._jump_muladd!(Γ, Γ_basis[i], var[i])
+    end
+    JuMP.@constraint(model, Symmetric(Γ) ∈ JuMP.PSDCone())
+
+    behaviour_op = Moment.behaviour_operator(eltype(S), outs, ins)
+    behaviour = Array{typeof(1 * first(var)),N}(undef, size(behaviour_op))
+    for i ∈ 1:length(behaviour)
+        behaviour[i] = var[monomial_dict[behaviour_op[i]]]
+    end
+    numerator = dot(vcg, behaviour)
+    denominator = dot(scg, behaviour)
+
+    JuMP.@constraint(model, denominator == 1)
+    JuMP.@objective(model, Max, numerator)
+
+    dualize && (solver = Dualization.dual_optimizer(solver; coefficient_type = _solver_type(T)))
+    Ket._set_optimizer(model, solver, solver_attributes, verbose)
+    JuMP.optimize!(model)
+    JuMP.is_solved_and_feasible(model) || @warn JuMP.raw_status(model)
+    return JuMP.objective_value(model)::T, (JuMP.value(behaviour)/JuMP.value(var[1]))::Array{T,N}
+end
+
+function _bound_tsirelson_postselection_manual(vcg::Matrix{T}, scg::Matrix{T}, scenario, include_ab::Bool; verbose, dualize, solver) where {T<:AbstractFloat}
     oa, ob, ia, ib = scenario
     alice_ops = ia * (oa - 1)
     bob_ops = ib * (ob - 1)
@@ -195,8 +201,8 @@ function _tsirelson_bound_postselection_manual(V::Matrix{T}, S::Matrix{T}, scena
         end
     end
 
-    bell_functional = dot(V, behaviour)
-    post = dot(S, behaviour)
+    bell_functional = dot(vcg, behaviour)
+    post = dot(scg, behaviour)
 
     JuMP.@constraint(model, post == 1)
     JuMP.@objective(model, Max, bell_functional)

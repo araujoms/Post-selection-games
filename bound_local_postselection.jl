@@ -1,14 +1,14 @@
 """
-    local_bound(V::Array{T,4}, S::Array{T,4})
+    bound_local_postselection(V::Array{T,4}, S::Array{T,4})
 
 Computes the local bound of a post-selection game `V`, `S` written in probability notation.
 """
-function local_bound_postselection(V::Array{T,4}, S::Array{T,4}) where {T<:Real}
+function bound_local_postselection(V::Array{T,4}, S::Array{T,4}) where {T<:Real}
     oa, ob, ia, ib = size(V)
 
     a_vec = Vector{Int}(undef, ia)
     b_vec = Vector{Int}(undef, ib)
-    bound = float(T(0))
+    bound = zero(one(T) / one(T))
     for a = 0:oa^ia-1
         digits!(a_vec, a; base = oa)
         for b = 0:ob^ib-1
@@ -21,7 +21,7 @@ function local_bound_postselection(V::Array{T,4}, S::Array{T,4}) where {T<:Real}
             end
             if p_post != 0
                 if p_win == p_post
-                    return float(T(1))
+                    return p_win / p_post
                 else
                     temp_bound = p_win / p_post
                     temp_bound > bound && (bound = temp_bound)
