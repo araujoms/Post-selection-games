@@ -19,7 +19,8 @@ function bound_tsirelson_postselection(
     vcg::Matrix{T},
     scg::Matrix{T},
     scenario::Tuple,
-    level::Union{Integer,String};
+    level::Union{Integer,String},
+    ωq::T = zero(T);
     verbose::Bool = false,
     dualize::Bool = false,
     solver = Hypatia.Optimizer{Ket._solver_type(T)},
@@ -32,14 +33,14 @@ function bound_tsirelson_postselection(
     level_int, additional = Moment.parse_level(Val(2), level)
     if level_int == 1 && (isempty(additional) || additional == [[1, 1]])
         include_ab = !isempty(additional)
-        return _bound_tsirelson_postselection_manual(vcg, scg, scenario, include_ab; verbose, dualize = !dualize, solver)
+        return _bound_tsirelson_postselection_manual(vcg, scg, scenario, include_ab, ωq; verbose, dualize = !dualize, solver)
     end
 
     outs = scenario[1:2]
     ins = scenario[3:4]
     max_length = 2 * max(level_int, maximum(length.(additional); init = 0))
     Q, behaviour =
-        _npa_postselection(vcg, scg, Moment.Projector, Val(max_length), outs, ins, level_int, additional; verbose, dualize, solver, solver_attributes)
+        _npa_postselection(vcg, scg, Moment.Projector, Val(max_length), outs, ins, level_int, additional, ωq; verbose, dualize, solver, solver_attributes)
     return Q, behaviour
 end
 
@@ -51,7 +52,8 @@ function _npa_postselection(
     outs::NTuple{N,<:Integer},
     ins::NTuple{N,<:Integer},
     level_int::Int,
-    additional::Vector{Vector{Int}};
+    additional::Vector{Vector{Int}},
+    ωq::T;
     verbose,
     dualize,
     solver,
@@ -82,8 +84,14 @@ function _npa_postselection(
     numerator = dot(vcg, behaviour)
     denominator = dot(scg, behaviour)
 
-    JuMP.@constraint(model, denominator == 1)
-    JuMP.@objective(model, Max, numerator)
+    if ωq == 0
+        JuMP.@constraint(model, denominator == 1)
+        JuMP.@objective(model, Max, numerator)
+    else
+        JuMP.@constraint(model, numerator == ωq * denominator)
+        JuMP.@constraint(model, var[1] == 1)
+        JuMP.@objective(model, Max, denominator)
+    end
 
     dualize && (solver = Dualization.dual_optimizer(solver; coefficient_type = _solver_type(T)))
     Ket._set_optimizer(model, solver, solver_attributes, verbose)
@@ -92,7 +100,7 @@ function _npa_postselection(
     return JuMP.objective_value(model)::T, (JuMP.value(behaviour)/JuMP.value(var[1]))::Array{T,N}
 end
 
-function _bound_tsirelson_postselection_manual(vcg::Matrix{T}, scg::Matrix{T}, scenario, include_ab::Bool; verbose, dualize, solver) where {T<:AbstractFloat}
+function _bound_tsirelson_postselection_manual(vcg::Matrix{T}, scg::Matrix{T}, scenario, include_ab::Bool, ωq; verbose, dualize, solver) where {T<:AbstractFloat}
     oa, ob, ia, ib = scenario
     alice_ops = ia * (oa - 1)
     bob_ops = ib * (ob - 1)
@@ -201,11 +209,17 @@ function _bound_tsirelson_postselection_manual(vcg::Matrix{T}, scg::Matrix{T}, s
         end
     end
 
-    bell_functional = dot(vcg, behaviour)
-    post = dot(scg, behaviour)
+    numerator = dot(vcg, behaviour)
+    denominator = dot(scg, behaviour)
 
-    JuMP.@constraint(model, post == 1)
-    JuMP.@objective(model, Max, bell_functional)
+    if ωq == 0
+        JuMP.@constraint(model, denominator == 1)
+        JuMP.@objective(model, Max, numerator)
+    else
+        JuMP.@constraint(model, numerator == ωq * denominator)
+        JuMP.@constraint(model, Γ[1, 1] == 1)
+        JuMP.@objective(model, Max, denominator)
+    end
 
     if dualize
         JuMP.set_optimizer(model, Dualization.dual_optimizer(solver; coefficient_type = T))
@@ -216,7 +230,7 @@ function _bound_tsirelson_postselection_manual(vcg::Matrix{T}, scg::Matrix{T}, s
 
     JuMP.optimize!(model)
     JuMP.is_solved_and_feasible(model) || @warn JuMP.raw_status(model)
-    behaviour = JuMP.value.(behaviour)
+    behaviour = JuMP.value(behaviour)
     behaviour ./= behaviour[1]
     return JuMP.objective_value(model)::T, behaviour::Matrix{T}
 end
